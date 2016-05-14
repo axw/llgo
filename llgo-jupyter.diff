@@ -1,0 +1,593 @@
+Index: CMakeLists.txt
+===================================================================
+--- CMakeLists.txt	(revision 246908)
++++ CMakeLists.txt	(working copy)
+@@ -137,9 +137,22 @@
+           "go=${CMAKE_BINARY_DIR}/bin/llgo-go"
+ )
+ 
++llvm_add_go_executable(llgo-jupyter llvm.org/llgo/cmd/llgo-jupyter ALL
++  DEPENDS libgo ${CMAKE_BINARY_DIR}/bin/llgo${CMAKE_EXECUTABLE_SUFFIX}
++          ${CMAKE_BINARY_DIR}/lib/go/llgo-${LLGO_VERSION}/cgo
++          ${CMAKE_BINARY_DIR}/bin/llgo-go${CMAKE_EXECUTABLE_SUFFIX}
++          cmd/llgo-jupyter/llgoi.go
++          cmd/llgo-jupyter/kernel.go
++  GOFLAGS "cc=${CMAKE_BINARY_DIR}/bin/clang"
++          "cxx=${CMAKE_BINARY_DIR}/bin/clang++"
++          "go=${CMAKE_BINARY_DIR}/bin/llgo-go"
++	  "ldflags=-lzmq"
++)
++
+ install(FILES ${CMAKE_BINARY_DIR}/bin/llgo${CMAKE_EXECUTABLE_SUFFIX}
+               ${CMAKE_BINARY_DIR}/bin/llgoi${CMAKE_EXECUTABLE_SUFFIX}
+               ${CMAKE_BINARY_DIR}/bin/llgo-go${CMAKE_EXECUTABLE_SUFFIX}
++	      ${CMAKE_BINARY_DIR}/bin/llgo-jupyter${CMAKE_EXECUTABLE_SUFFIX}
+         DESTINATION bin
+         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                     GROUP_READ GROUP_EXECUTE
+Index: cmd/llgoi/llgoi.go
+===================================================================
+--- cmd/llgoi/llgoi.go	(revision 246908)
++++ cmd/llgoi/llgoi.go	(working copy)
+@@ -14,8 +14,10 @@
+ package main
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"errors"
++	"flag"
+ 	"fmt"
+ 	"go/ast"
+ 	"go/build"
+@@ -38,6 +40,20 @@
+ 	"llvm.org/llvm/bindings/go/llvm"
+ )
+ 
++// /* Force exporting __morestack if it's available, so that it is
++//    available to the engine when linking with libLLVM.so. */
++//
++// void *__morestack __attribute__((weak));
++import "C"
++
++var (
++	dumpSource bool
++)
++
++func init() {
++	flag.BoolVar(&dumpSource, "fdump-trace", false, "enable dumping source to stderr before execution")
++}
++
+ func getInstPrefix() (string, error) {
+ 	path, err := exec.LookPath(os.Args[0])
+ 	if err != nil {
+@@ -127,29 +143,29 @@
+ 	in.engine.Dispose()
+ }
+ 
+-func (in *interp) loadSourcePackageFromCode(pkgcode, pkgpath string, copts irgen.CompilerOptions) (*types.Package, error) {
++func (in *interp) loadSourcePackageFromCode(pkgcode, pkgpath string, copts irgen.CompilerOptions) (*types.Package, []interface{}, error) {
+ 	fset := token.NewFileSet()
+ 	file, err := parser.ParseFile(fset, "<input>", pkgcode, parser.DeclarationErrors|parser.ParseComments)
+ 	if err != nil {
+-		return nil, err
++		return nil, nil, err
+ 	}
+-
+ 	files := []*ast.File{file}
+-
+ 	return in.loadSourcePackage(fset, files, pkgpath, copts)
+ }
+ 
+-func (in *interp) loadSourcePackage(fset *token.FileSet, files []*ast.File, pkgpath string, copts irgen.CompilerOptions) (pkg *types.Package, err error) {
++func (in *interp) loadSourcePackage(fset *token.FileSet, files []*ast.File, pkgpath string, copts irgen.CompilerOptions) (
++	_ *types.Package, _ []interface{}, resultErr error,
++) {
+ 	compiler, err := irgen.NewCompiler(copts)
+ 	if err != nil {
+-		return
++		return nil, nil, err
+ 	}
+ 
+ 	module, err := compiler.Compile(fset, files, pkgpath)
+ 	if err != nil {
+-		return
++		return nil, nil, err
+ 	}
+-	pkg = module.Package
++	pkg := module.Package
+ 
+ 	if in.engine.C != nil {
+ 		in.engine.AddModule(module.Module)
+@@ -157,25 +173,41 @@
+ 		options := llvm.NewMCJITCompilerOptions()
+ 		in.engine, err = llvm.NewMCJITCompiler(module.Module, options)
+ 		if err != nil {
+-			return
++			return nil, nil, err
+ 		}
+ 	}
+ 
+-	importname := irgen.ManglePackagePath(pkgpath) + "..import$descriptor"
+-	importglobal := module.Module.NamedGlobal(importname)
++	getPackageSymbol := func(name string) unsafe.Pointer {
++		symbolName := irgen.ManglePackagePath(pkgpath) + "." + name
++		global := module.Module.NamedGlobal(symbolName)
++		if global.IsNil() {
++			return nil
++		}
++		return in.engine.PointerToGlobal(global)
++	}
+ 
+-	var importfunc func()
+-	*(*unsafe.Pointer)(unsafe.Pointer(&importfunc)) = in.engine.PointerToGlobal(importglobal)
++	var importFunc func()
++	importAddress := getPackageSymbol(".import$descriptor")
++	*(*unsafe.Pointer)(unsafe.Pointer(&importFunc)) = importAddress
+ 
+ 	defer func() {
+ 		p := recover()
+ 		if p != nil {
+-			err = fmt.Errorf("panic: %v\n%v", p, string(debug.Stack()))
++			resultErr = fmt.Errorf("panic: %v\n%v", p, string(debug.Stack()))
+ 		}
+ 	}()
+-	importfunc()
++	importFunc()
+ 	in.pkgmap[pkgpath] = pkg
+-	return
++
++	var results []interface{}
++	llgoiResultsAddress := getPackageSymbol("__llgoiResults$descriptor")
++	if llgoiResultsAddress != nil {
++		var resultsFunc func() []interface{}
++		*(*unsafe.Pointer)(unsafe.Pointer(&resultsFunc)) = llgoiResultsAddress
++		results = resultsFunc()
++	}
++
++	return pkg, results, nil
+ }
+ 
+ func (in *interp) augmentPackageScope(pkg *types.Package) {
+@@ -240,19 +272,17 @@
+ 	return l.parens <= 0 && l.bracks <= 0 && l.braces <= 0
+ }
+ 
+-func (in *interp) readExprLine(str string, assigns []string) error {
++func (in *interp) readExprLine(str string, assigns []string) ([]interface{}, error) {
+ 	in.pendingLine.append(str, assigns)
+-
+-	if in.pendingLine.ready() {
+-		err := in.interpretLine(in.pendingLine)
+-		in.pendingLine = line{}
+-		return err
+-	} else {
+-		return nil
++	if !in.pendingLine.ready() {
++		return nil, nil
+ 	}
++	results, err := in.interpretLine(in.pendingLine)
++	in.pendingLine = line{}
++	return results, err
+ }
+ 
+-func (in *interp) interpretLine(l line) error {
++func (in *interp) interpretLine(l line) ([]interface{}, error) {
+ 	pkgname := fmt.Sprintf("input%05d", in.pkgnum)
+ 	in.pkgnum++
+ 
+@@ -271,14 +301,12 @@
+ 		var err error
+ 		tv, err = types.Eval(l.line, pkg, scope)
+ 		if err != nil {
+-			return err
++			return nil, err
+ 		}
+ 	}
+ 
+ 	var code bytes.Buffer
+-	fmt.Fprintf(&code, "package %s", pkgname)
+-	code.WriteString("\n\nimport __fmt__ \"fmt\"\n")
+-	code.WriteString("import __os__ \"os\"\n")
++	fmt.Fprintf(&code, "package %s\n", pkgname)
+ 
+ 	for _, pkg := range in.imports {
+ 		fmt.Fprintf(&code, "import %q\n", pkg.Path())
+@@ -300,7 +328,7 @@
+ 			typs = append(typs, types.Typ[types.Bool])
+ 		}
+ 		if len(l.assigns) != 0 && len(l.assigns) != len(typs) {
+-			return errors.New("return value mismatch")
++			return nil, errors.New("return value mismatch")
+ 		}
+ 
+ 		code.WriteString("var ")
+@@ -318,42 +346,53 @@
+ 				fmt.Fprintf(&code, "__llgoiV%d", i)
+ 			}
+ 		}
+-		fmt.Fprintf(&code, " = %s\n\n", l.line)
++		fmt.Fprintf(&code, " = %s\n", l.line)
+ 
+-		code.WriteString("func init() {\n\t")
+-		for i, t := range typs {
+-			var varname, prefix string
++		code.WriteString("func init() {\n")
++		varnames := make([]string, len(typs))
++		for i := range typs {
++			var varname string
+ 			if len(l.assigns) != 0 && l.assigns[i] != "" {
+ 				if _, ok := in.scope[l.assigns[i]]; ok {
+ 					fmt.Fprintf(&code, "\t%s = __llgoiV%d\n", l.assigns[i], i)
+ 				}
+ 				varname = l.assigns[i]
+-				prefix = l.assigns[i]
+ 			} else {
+ 				varname = fmt.Sprintf("__llgoiV%d", i)
+-				prefix = fmt.Sprintf("#%d", i)
+ 			}
+-			if _, ok := t.Underlying().(*types.Interface); ok {
+-				fmt.Fprintf(&code, "\t__fmt__.Printf(\"%s %s (%%T) = %%+v\\n\", %s, %s)\n", prefix, t.String(), varname, varname)
+-			} else {
+-				fmt.Fprintf(&code, "\t__fmt__.Printf(\"%s %s = %%+v\\n\", %s)\n", prefix, t.String(), varname)
+-			}
++			varnames[i] = varname
+ 		}
+-		code.WriteString("}")
++		code.WriteString("}\n\n")
++
++		code.WriteString("func __llgoiResults() []interface{} {\n")
++		code.WriteString("\treturn []interface{}{\n")
++		for _, varname := range varnames {
++			fmt.Fprintf(&code, "\t\t%s,\n", varname)
++		}
++		code.WriteString("\t}\n")
++		code.WriteString("}\n")
+ 	} else {
+ 		if len(l.assigns) != 0 {
+-			return errors.New("return value mismatch")
++			return nil, errors.New("return value mismatch")
+ 		}
+ 
+ 		fmt.Fprintf(&code, "func init() {\n\t%s}", l.line)
+ 	}
+ 
++	source := code.String()
++	if dumpSource {
++		scanner := bufio.NewScanner(&code)
++		for line := 1; scanner.Scan(); line++ {
++			fmt.Fprintf(os.Stderr, "//%04d: %s\n", line, scanner.Text())
++		}
++	}
++
+ 	copts := in.copts
+ 	copts.PackageCreated = in.augmentPackageScope
+ 	copts.DisableUnusedImportCheck = true
+-	pkg, err := in.loadSourcePackageFromCode(code.String(), pkgname, copts)
++	pkg, results, err := in.loadSourcePackageFromCode(source, pkgname, copts)
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
+ 
+ 	in.imports = append(in.imports, pkg)
+@@ -370,7 +409,7 @@
+ 		in.scope[l.declName] = pkg.Scope().Lookup(l.declName)
+ 	}
+ 
+-	return nil
++	return results, nil
+ }
+ 
+ func (in *interp) maybeReadAssignment(line string, s *scanner.Scanner, initial string, base int) (bool, error) {
+@@ -398,7 +437,9 @@
+ 		return false, nil
+ 	}
+ 
+-	return true, in.readExprLine(line[int(pos)-base+2:], assigns)
++	// It's an assignment statement, there are no results.
++	_, err := in.readExprLine(line[int(pos)-base+2:], assigns)
++	return true, err
+ }
+ 
+ func (in *interp) loadPackage(pkgpath string) (*types.Package, error) {
+@@ -422,8 +463,6 @@
+ 		}
+ 	}
+ 
+-	fmt.Printf("# %s\n", pkgpath)
+-
+ 	inputs := make([]string, len(buildpkg.GoFiles))
+ 	for i, file := range buildpkg.GoFiles {
+ 		inputs[i] = filepath.Join(buildpkg.Dir, file)
+@@ -435,12 +474,13 @@
+ 		return nil, err
+ 	}
+ 
+-	return in.loadSourcePackage(fset, files, pkgpath, in.copts)
++	pkg, _, err = in.loadSourcePackage(fset, files, pkgpath, in.copts)
++	return pkg, err
+ }
+ 
+ // readLine accumulates lines of input, including trailing newlines,
+ // executing statements as they are completed.
+-func (in *interp) readLine(line string) error {
++func (in *interp) readLine(line string) ([]interface{}, error) {
+ 	if !in.pendingLine.ready() {
+ 		return in.readExprLine(line, nil)
+ 	}
+@@ -453,33 +493,32 @@
+ 	_, tok, lit := s.Scan()
+ 	switch tok {
+ 	case token.EOF:
+-		return nil
++		return nil, nil
+ 
+ 	case token.IMPORT:
+ 		_, tok, lit = s.Scan()
+ 		if tok != token.STRING {
+-			return errors.New("expected string literal")
++			return nil, errors.New("expected string literal")
+ 		}
+ 		pkgpath, err := strconv.Unquote(lit)
+ 		if err != nil {
+-			return err
++			return nil, err
+ 		}
+ 		pkg, err := in.loadPackage(pkgpath)
+ 		if err != nil {
+-			return err
++			return nil, err
+ 		}
+ 		in.imports = append(in.imports, pkg)
+-		return nil
++		return nil, nil
+ 
+ 	case token.IDENT:
+ 		ok, err := in.maybeReadAssignment(line, &s, lit, file.Base())
+ 		if err != nil {
+-			return err
++			return nil, err
+ 		}
+ 		if ok {
+-			return nil
++			return nil, nil
+ 		}
+-
+ 		fallthrough
+ 
+ 	default:
+@@ -487,6 +526,14 @@
+ 	}
+ }
+ 
++// printResult prints a value that was the result of an expression evaluated
++// by the interpreter.
++func printResult(w io.Writer, v interface{}) {
++	// TODO the result should be formatted in Go syntax, without
++	// package qualifiers for types defined within the interpreter.
++	fmt.Fprintf(w, "%+v", v)
++}
++
+ // formatHistory reformats the provided Go source by collapsing all lines
+ // and adding semicolons where required, suitable for adding to line history.
+ func formatHistory(input []byte) string {
+@@ -522,6 +569,7 @@
+ }
+ 
+ func main() {
++	flag.Parse()
+ 	llvm.LinkInMCJIT()
+ 	llvm.InitializeNativeTarget()
+ 	llvm.InitializeNativeAsmPrinter()
+@@ -554,10 +602,14 @@
+ 			continue
+ 		}
+ 		buf.WriteString(line + "\n")
+-		err = in.readLine(line + "\n")
++		results, err := in.readLine(line + "\n")
+ 		if err != nil {
+ 			fmt.Println(err)
+ 		}
++		for _, result := range results {
++			printResult(os.Stdout, result)
++			fmt.Println()
++		}
+ 	}
+ 
+ 	if liner.TerminalSupported() {
+Index: irgen/value.go
+===================================================================
+--- irgen/value.go	(revision 246908)
++++ irgen/value.go	(working copy)
+@@ -17,6 +17,7 @@
+ import (
+ 	"fmt"
+ 	"go/token"
++
+ 	"llvm.org/llgo/third_party/gotools/go/exact"
+ 	"llvm.org/llgo/third_party/gotools/go/types"
+ 	"llvm.org/llvm/bindings/go/llvm"
+Index: test/llgoi/arith.test
+===================================================================
+--- test/llgoi/arith.test	(revision 246908)
++++ test/llgoi/arith.test	(working copy)
+@@ -1,4 +1,4 @@
+ // RUN: llgoi < %s | FileCheck %s
+ 
+ 1 + 1
+-// CHECK: #0 untyped int = 2
++// CHECK: 2
+Index: test/llgoi/import-source.test
+===================================================================
+--- test/llgoi/import-source.test	(revision 246908)
++++ test/llgoi/import-source.test	(working copy)
+@@ -4,17 +4,15 @@
+ Answer := 1
+ 
+ import "foo"
+-// CHECK: # bar
+-// CHECK: # foo
+ 
+ // Test that importing binary after source works.
+ import "strconv"
+ 
+ foo.Answer()
+-// CHECK: #0 int = 42
++// CHECK: 42
+ 
+ strconv.FormatBool(true)
+-// CHECK: #0 string = true
++// CHECK: true
+ 
+ var v1 strconv.NumError
+ var v2 strconv.NumError
+Index: test/llgoi/import-source2.test
+===================================================================
+--- test/llgoi/import-source2.test	(revision 246908)
++++ test/llgoi/import-source2.test	(working copy)
+@@ -4,11 +4,9 @@
+ import "strconv"
+ 
+ import "foo"
+-// CHECK: # bar
+-// CHECK: # foo
+ 
+ foo.Answer()
+-// CHECK: #0 int = 42
++// CHECK: 42
+ 
+ strconv.FormatBool(true)
+-// CHECK: #0 string = true
++// CHECK: true
+Index: test/llgoi/interfaces.test
+===================================================================
+--- test/llgoi/interfaces.test	(revision 246908)
++++ test/llgoi/interfaces.test	(working copy)
+@@ -2,18 +2,15 @@
+ 
+ import "errors"
+ err := errors.New("foo")
+-// CHECK: err error {{.*}} = foo
+ 
+ err.(interface{Foo()})
+ // CHECK: panic: interface conversion
+ 
+-_, _ := err.(interface{Foo()})
+-// CHECK: #0 interface{Foo()} (<nil>) = <nil>
+-// CHECK: #1 bool = false
++_, ok := err.(interface{Foo()})
++ok
++// CHECK: false
+ 
+ err.(interface{Error() string})
+-// CHECK: #0 interface{Error() string} {{.*}} = foo
++// CHECK: foo
+ 
+ _, _ := err.(interface{Error() string})
+-// CHECK: #0 interface{Error() string} {{.*}} = foo
+-// CHECK: #1 bool = true
+Index: test/llgoi/maps.test
+===================================================================
+--- test/llgoi/maps.test	(revision 246908)
++++ test/llgoi/maps.test	(working copy)
+@@ -1,14 +1,13 @@
+ // RUN: llgoi < %s | FileCheck %s
+ 
+ m := make(map[int]int)
+-// CHECK: m map[int]int = map[]
++m
++// CHECK: map[]
+ 
+ m[0]
+-// CHECK: #0 int = 0
++// CHECK: 0
+ 
+ _, _ := m[0]
+-// CHECK: #0 int = 0
+-// CHECK: #1 bool = false
+ 
+ func() {
+ 	m[0] = 1
+@@ -15,8 +14,10 @@
+ }()
+ 
+ m[0]
+-// CHECK: #0 int = 1
++// CHECK: 1
+ 
+-_, _ := m[0]
+-// CHECK: #0 int = 1
+-// CHECK: #1 bool = true
++m0, ok := m[0]
++m0
++// CHECK: 1
++ok
++// CHECK: true
+Index: test/llgoi/vars.test
+===================================================================
+--- test/llgoi/vars.test	(revision 246908)
++++ test/llgoi/vars.test	(working copy)
+@@ -1,17 +1,18 @@
+ // RUN: llgoi < %s 2>&1 | FileCheck %s
+ 
+ x := 3
+-// CHECK: x untyped int = 3
++x
++// CHECK: 3
+ 
+ x + x
+-// CHECK: #0 int = 6
++// CHECK: 6
+ 
+ x * x
+-// CHECK: #0 int = 9
++// CHECK: 9
+ 
+ x = 4
+ x + x
+-// CHECK: #0 int = 8
++// CHECK: 8
+ 
+ x := true
+ // CHECK: cannot assign {{.*}} to x (variable of type int)
+@@ -19,11 +20,11 @@
+ x, y := func() (int, int) {
+ 	return 1, 2
+ }()
+-// CHECK: x int = 1
+-// CHECK: y int = 2
++// CHECK: 1
++// CHECK: 2
+ 
+ x, _ = func() (int, int) {
+ 	return 3, 4
+ }()
+ x
+-// CHECK: #0 int = 3
++// CHECK: 3
+Index: third_party/gofrontend/libgo/runtime/heapdump.c
+===================================================================
+--- third_party/gofrontend/libgo/runtime/heapdump.c	(revision 246908)
++++ third_party/gofrontend/libgo/runtime/heapdump.c	(working copy)
+@@ -72,9 +72,9 @@
+ 		nbuf += len;
+ 		return;
+ 	}
+-	runtime_write(dumpfd, buf, nbuf);
++	(void)runtime_write(dumpfd, buf, nbuf);
+ 	if(len >= BufSize) {
+-		runtime_write(dumpfd, data, len);
++		(void)runtime_write(dumpfd, data, len);
+ 		nbuf = 0;
+ 	} else {
+ 		runtime_memmove(buf, data, len);
+@@ -85,7 +85,7 @@
+ static void
+ flush(void)
+ {
+-	runtime_write(dumpfd, buf, nbuf);
++	(void)runtime_write(dumpfd, buf, nbuf);
+ 	nbuf = 0;
+ }
+ 

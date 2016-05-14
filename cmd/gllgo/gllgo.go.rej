@@ -1,0 +1,11 @@
+--- cmd/gllgo/gllgo.go
++++ cmd/gllgo/gllgo.go
+@@ -746,7 +746,7 @@
+ 			if opts.staticLibgo {
+ 				args = append(args, "-Wl,-Bstatic", "-lgo-llgo", "-Wl,-Bdynamic", "-lpthread", "-lm")
+ 			} else {
+-				args = append(args, "-lgo-llgo")
++				args = append(args, "-lgo-llgo", "-lm")
+ 			}
+ 		} else {
+ 			linkerPath = opts.gccgoPath

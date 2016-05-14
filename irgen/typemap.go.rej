@@ -1,0 +1,451 @@
+--- irgen/typemap.go
++++ irgen/typemap.go
+@@ -71,13 +71,25 @@
+ 
+ 	typeSliceType, methodSliceType, imethodSliceType, structFieldSliceType llvm.Type
+ 
+-	hashFnType, equalFnType llvm.Type
+-
+-	hashFnEmptyInterface, hashFnInterface, hashFnFloat, hashFnComplex, hashFnString, hashFnIdentity, hashFnError        llvm.Value
+-	equalFnEmptyInterface, equalFnInterface, equalFnFloat, equalFnComplex, equalFnString, equalFnIdentity, equalFnError llvm.Value
+-
+-	zeroType  llvm.Type
+-	zeroValue llvm.Value
++	funcValType                           llvm.Type
++	hashFnType, equalFnType               llvm.Type
++	ptrHashFnNestType, ptrEqualFnNestType llvm.Type // with *funcValType as first arg
++
++	hashFnEmptyInterfaceDescriptor,
++	hashFnInterfaceDescriptor,
++	hashFnFloatDescriptor,
++	hashFnComplexDescriptor,
++	hashFnStringDescriptor,
++	hashFnIdentityDescriptor,
++	hashFnErrorDescriptor llvm.Value
++
++	equalFnEmptyInterfaceDescriptor,
++	equalFnInterfaceDescriptor,
++	equalFnFloatDescriptor,
++	equalFnComplexDescriptor,
++	equalFnStringDescriptor,
++	equalFnIdentityDescriptor,
++	equalFnErrorDescriptor llvm.Value
+ }
+ 
+ func NewLLVMTypeMap(ctx llvm.Context, target llvm.TargetData) *llvmTypeMap {
+@@ -117,35 +129,60 @@
+ 	boolType := llvm.Int8Type()
+ 	stringPtrType := llvm.PointerType(tm.stringType, 0)
+ 
+-	// Create runtime algorithm function types.
++	tm.funcValType = tm.ctx.StructCreateNamed("funcVal")
++	tm.funcValType.StructSetBody([]llvm.Type{
++		llvm.PointerType(llvm.FunctionType(llvm.VoidType(), []llvm.Type{}, false), 0),
++	}, false)
++	ptrFuncValType := llvm.PointerType(tm.funcValType, 0)
++
+ 	params := []llvm.Type{voidPtrType, uintptrType}
+ 	tm.hashFnType = llvm.FunctionType(uintptrType, params, false)
++	params = []llvm.Type{ptrFuncValType, voidPtrType, uintptrType}
++	tm.ptrHashFnNestType = llvm.PointerType(llvm.FunctionType(uintptrType, params, false), 0)
+ 	params = []llvm.Type{voidPtrType, voidPtrType, uintptrType}
+ 	tm.equalFnType = llvm.FunctionType(boolType, params, false)
++	params = []llvm.Type{ptrFuncValType, voidPtrType, voidPtrType, uintptrType}
++	tm.ptrEqualFnNestType = llvm.PointerType(llvm.FunctionType(boolType, params, false), 0)
+ 
+-	tm.hashFnEmptyInterface = llvm.AddFunction(tm.module, "__go_type_hash_empty_interface", tm.hashFnType)
+-	tm.hashFnInterface = llvm.AddFunction(tm.module, "__go_type_hash_interface", tm.hashFnType)
+-	tm.hashFnFloat = llvm.AddFunction(tm.module, "__go_type_hash_float", tm.hashFnType)
+-	tm.hashFnComplex = llvm.AddFunction(tm.module, "__go_type_hash_complex", tm.hashFnType)
+-	tm.hashFnString = llvm.AddFunction(tm.module, "__go_type_hash_string", tm.hashFnType)
+-	tm.hashFnIdentity = llvm.AddFunction(tm.module, "__go_type_hash_identity", tm.hashFnType)
+-	tm.hashFnError = llvm.AddFunction(tm.module, "__go_type_hash_error", tm.hashFnType)
+-
+-	tm.equalFnEmptyInterface = llvm.AddFunction(tm.module, "__go_type_equal_empty_interface", tm.equalFnType)
+-	tm.equalFnInterface = llvm.AddFunction(tm.module, "__go_type_equal_interface", tm.equalFnType)
+-	tm.equalFnFloat = llvm.AddFunction(tm.module, "__go_type_equal_float", tm.equalFnType)
+-	tm.equalFnComplex = llvm.AddFunction(tm.module, "__go_type_equal_complex", tm.equalFnType)
+-	tm.equalFnString = llvm.AddFunction(tm.module, "__go_type_equal_string", tm.equalFnType)
+-	tm.equalFnIdentity = llvm.AddFunction(tm.module, "__go_type_equal_identity", tm.equalFnType)
+-	tm.equalFnError = llvm.AddFunction(tm.module, "__go_type_equal_error", tm.equalFnType)
+-
+-	// The body of this type is set in emitTypeDescInitializers once we have scanned
+-	// every type, as it needs to be as large and well aligned as the
+-	// largest/most aligned type.
+-	tm.zeroType = tm.ctx.StructCreateNamed("zero")
+-	tm.zeroValue = llvm.AddGlobal(tm.module, tm.zeroType, "go$zerovalue")
+-	tm.zeroValue.SetLinkage(llvm.CommonLinkage)
+-	tm.zeroValue.SetInitializer(llvm.ConstNull(tm.zeroType))
++	algorithmDescriptors := [...]struct {
++		Name  string
++		Hash  *llvm.Value
++		Equal *llvm.Value
++	}{{
++		"empty_interface",
++		&tm.hashFnEmptyInterfaceDescriptor,
++		&tm.equalFnEmptyInterfaceDescriptor,
++	}, {
++		"interface",
++		&tm.hashFnInterfaceDescriptor,
++		&tm.equalFnInterfaceDescriptor,
++	}, {
++		"float",
++		&tm.hashFnFloatDescriptor,
++		&tm.equalFnFloatDescriptor,
++	}, {
++		"complex",
++		&tm.hashFnComplexDescriptor,
++		&tm.equalFnComplexDescriptor,
++	}, {
++		"string",
++		&tm.hashFnStringDescriptor,
++		&tm.equalFnStringDescriptor,
++	}, {
++		"identity",
++		&tm.hashFnIdentityDescriptor,
++		&tm.equalFnIdentityDescriptor,
++	}, {
++		"error",
++		&tm.hashFnErrorDescriptor,
++		&tm.equalFnErrorDescriptor,
++	}}
++	for _, alg := range algorithmDescriptors {
++		hashDescriptorName := "__go_type_hash_" + alg.Name + "_descriptor"
++		equalDescriptorName := "__go_type_equal_" + alg.Name + "_descriptor"
++		*alg.Hash = llvm.AddGlobal(tm.module, tm.funcValType, hashDescriptorName)
++		*alg.Equal = llvm.AddGlobal(tm.module, tm.funcValType, equalDescriptorName)
++	}
+ 
+ 	tm.commonTypeType = tm.ctx.StructCreateNamed("commonType")
+ 	commonTypeTypePtr := llvm.PointerType(tm.commonTypeType, 0)
+@@ -174,13 +211,12 @@
+ 		tm.ctx.Int8Type(),                        // fieldAlign
+ 		uintptrType,                              // size
+ 		tm.ctx.Int32Type(),                       // hash
+-		llvm.PointerType(tm.hashFnType, 0),       // hashfn
+-		llvm.PointerType(tm.equalFnType, 0),      // equalfn
++		llvm.PointerType(tm.funcValType, 0),      // hashfn
++		llvm.PointerType(tm.funcValType, 0),      // equalfn
+ 		voidPtrType,                              // gc
+ 		stringPtrType,                            // string
+ 		llvm.PointerType(tm.uncommonTypeType, 0), // uncommonType
+ 		commonTypeTypePtr,                        // ptrToThis
+-		llvm.PointerType(tm.zeroType, 0),         // zero
+ 	}, false)
+ 
+ 	tm.typeSliceType = tm.makeNamedSliceType("typeSlice", commonTypeTypePtr)
+@@ -1096,9 +1132,6 @@
+ 			}
+ 		}
+ 	}
+-
+-	tm.zeroType.StructSetBody([]llvm.Type{llvm.ArrayType(tm.ctx.Int8Type(), int(maxSize))}, false)
+-	tm.zeroValue.SetAlignment(int(maxAlign))
+ }
+ 
+ const (
+@@ -1247,8 +1280,8 @@
+ 	equals := make([]llvm.Value, st.NumFields())
+ 
+ 	for i := range hashes {
+-		fhash, fequal := tm.getAlgorithmFunctions(st.Field(i).Type())
+-		if fhash == tm.hashFnError {
++		fhash, fequal := tm.getAlgorithmDescriptors(st.Field(i).Type())
++		if fhash == tm.hashFnErrorDescriptor {
+ 			return fhash, fequal
+ 		}
+ 		hashes[i], equals[i] = fhash, fequal
+@@ -1260,53 +1293,52 @@
+ 	builder := tm.ctx.NewBuilder()
+ 	defer builder.Dispose()
+ 
+-	hash = llvm.AddFunction(tm.module, tm.mc.mangleHashFunctionName(st), tm.hashFnType)
+-	hash.SetLinkage(llvm.LinkOnceODRLinkage)
+-	builder.SetInsertPointAtEnd(llvm.AddBasicBlock(hash, "entry"))
+-	sptr := builder.CreateBitCast(hash.Param(0), llsptrty, "")
++	hashFunctionName := tm.mc.mangleHashFunctionName(st)
++	hashFn := llvm.AddFunction(tm.module, hashFunctionName, tm.hashFnType)
++	hashFn.SetLinkage(llvm.LinkOnceODRLinkage)
++	hash = tm.createAlgorithmDescriptor(hashFunctionName+"_descriptor", hashFn)
++
++	builder.SetInsertPointAtEnd(llvm.AddBasicBlock(hashFn, "entry"))
++	sptr := builder.CreateBitCast(hashFn.Param(0), llsptrty, "")
+ 
+ 	hashval := llvm.ConstNull(tm.inttype)
+ 	i33 := llvm.ConstInt(tm.inttype, 33, false)
+ 
+-	for i, fhash := range hashes {
++	for i, hashDescriptor := range hashes {
+ 		fptr := builder.CreateStructGEP(sptr, i, "")
+ 		fptr = builder.CreateBitCast(fptr, i8ptr, "")
+-
+ 		fsize := llvm.ConstInt(tm.inttype, uint64(tm.sizes.Sizeof(st.Field(i).Type())), false)
+-
+-		hashcall := builder.CreateCall(fhash, []llvm.Value{fptr, fsize}, "")
++		fhash := tm.callHashDescriptor(builder, hashDescriptor, fptr, fsize)
+ 		hashval = builder.CreateMul(hashval, i33, "")
+-		hashval = builder.CreateAdd(hashval, hashcall, "")
++		hashval = builder.CreateAdd(hashval, fhash, "")
+ 	}
+ 
+ 	builder.CreateRet(hashval)
+ 
+-	equal = llvm.AddFunction(tm.module, tm.mc.mangleEqualFunctionName(st), tm.equalFnType)
+-	equal.SetLinkage(llvm.LinkOnceODRLinkage)
+-	eqentrybb := llvm.AddBasicBlock(equal, "entry")
+-	eqretzerobb := llvm.AddBasicBlock(equal, "retzero")
++	equalFunctionName := tm.mc.mangleEqualFunctionName(st)
++	equalFn := llvm.AddFunction(tm.module, equalFunctionName, tm.equalFnType)
++	equalFn.SetLinkage(llvm.LinkOnceODRLinkage)
++	equal = tm.createAlgorithmDescriptor(equalFunctionName+"_descriptor", equalFn)
+ 
++	eqentrybb := llvm.AddBasicBlock(equalFn, "entry")
++	eqretzerobb := llvm.AddBasicBlock(equalFn, "retzero")
+ 	builder.SetInsertPointAtEnd(eqentrybb)
+-	s1ptr := builder.CreateBitCast(equal.Param(0), llsptrty, "")
+-	s2ptr := builder.CreateBitCast(equal.Param(1), llsptrty, "")
++	s1ptr := builder.CreateBitCast(equalFn.Param(0), llsptrty, "")
++	s2ptr := builder.CreateBitCast(equalFn.Param(1), llsptrty, "")
+ 
+ 	zerobool := llvm.ConstNull(tm.ctx.Int8Type())
+ 	onebool := llvm.ConstInt(tm.ctx.Int8Type(), 1, false)
+ 
+-	for i, fequal := range equals {
++	for i, equalDescriptor := range equals {
+ 		f1ptr := builder.CreateStructGEP(s1ptr, i, "")
+ 		f1ptr = builder.CreateBitCast(f1ptr, i8ptr, "")
+ 		f2ptr := builder.CreateStructGEP(s2ptr, i, "")
+ 		f2ptr = builder.CreateBitCast(f2ptr, i8ptr, "")
+-
+ 		fsize := llvm.ConstInt(tm.inttype, uint64(tm.sizes.Sizeof(st.Field(i).Type())), false)
+-
+-		equalcall := builder.CreateCall(fequal, []llvm.Value{f1ptr, f2ptr, fsize}, "")
+-		equaleqzero := builder.CreateICmp(llvm.IntEQ, equalcall, zerobool, "")
+-
+-		contbb := llvm.AddBasicBlock(equal, "cont")
++		fequal := tm.callEqualDescriptor(builder, equalDescriptor, f1ptr, f2ptr, fsize)
++		equaleqzero := builder.CreateICmp(llvm.IntEQ, fequal, zerobool, "")
++		contbb := llvm.AddBasicBlock(equalFn, "cont")
+ 		builder.CreateCondBr(equaleqzero, eqretzerobb, contbb)
+-
+ 		builder.SetInsertPointAtEnd(contbb)
+ 	}
+ 
+@@ -1324,8 +1356,8 @@
+ 		return algs.hash, algs.equal
+ 	}
+ 
+-	ehash, eequal := tm.getAlgorithmFunctions(at.Elem())
+-	if ehash == tm.hashFnError {
++	ehash, eequal := tm.getAlgorithmDescriptors(at.Elem())
++	if ehash == tm.hashFnErrorDescriptor {
+ 		return ehash, eequal
+ 	}
+ 
+@@ -1339,20 +1371,28 @@
+ 	builder := tm.ctx.NewBuilder()
+ 	defer builder.Dispose()
+ 
+-	hash = llvm.AddFunction(tm.module, tm.mc.mangleHashFunctionName(at), tm.hashFnType)
+-	hash.SetLinkage(llvm.LinkOnceODRLinkage)
+-	hashentrybb := llvm.AddBasicBlock(hash, "entry")
++	hashFunctionName := tm.mc.mangleHashFunctionName(at)
++	hashFn := llvm.AddFunction(tm.module, hashFunctionName, tm.hashFnType)
++	hashFn.SetLinkage(llvm.LinkOnceODRLinkage)
++	hash = tm.createAlgorithmDescriptor(hashFunctionName+"_descriptor", hashFn)
++	equalFunctionName := tm.mc.mangleHashFunctionName(at)
++	equalFn := llvm.AddFunction(tm.module, equalFunctionName, tm.equalFnType)
++	equalFn.SetLinkage(llvm.LinkOnceODRLinkage)
++	equal = tm.createAlgorithmDescriptor(equalFunctionName+"_descriptor", equalFn)
++	tm.algs.Set(at, algorithmFns{hash, equal})
++
++	hashentrybb := llvm.AddBasicBlock(hashFn, "entry")
+ 	builder.SetInsertPointAtEnd(hashentrybb)
+ 	if at.Len() == 0 {
+ 		builder.CreateRet(llvm.ConstNull(tm.inttype))
+ 	} else {
+ 		i33 := llvm.ConstInt(tm.inttype, 33, false)
+ 
+-		aptr := builder.CreateBitCast(hash.Param(0), llelemty, "")
+-		loopbb := llvm.AddBasicBlock(hash, "loop")
++		aptr := builder.CreateBitCast(hashFn.Param(0), llelemty, "")
++		loopbb := llvm.AddBasicBlock(hashFn, "loop")
+ 		builder.CreateBr(loopbb)
+ 
+-		exitbb := llvm.AddBasicBlock(hash, "exit")
++		exitbb := llvm.AddBasicBlock(hashFn, "exit")
+ 
+ 		builder.SetInsertPointAtEnd(loopbb)
+ 		indexphi := builder.CreatePHI(tm.inttype, "")
+@@ -1363,7 +1403,7 @@
+ 		eptr := builder.CreateGEP(aptr, []llvm.Value{index}, "")
+ 		eptr = builder.CreateBitCast(eptr, i8ptr, "")
+ 
+-		hashcall := builder.CreateCall(ehash, []llvm.Value{eptr, esize}, "")
++		hashcall := tm.callHashDescriptor(builder, ehash, eptr, esize)
+ 		hashval = builder.CreateMul(hashval, i33, "")
+ 		hashval = builder.CreateAdd(hashval, hashcall, "")
+ 
+@@ -1388,20 +1428,18 @@
+ 	zerobool := llvm.ConstNull(tm.ctx.Int8Type())
+ 	onebool := llvm.ConstInt(tm.ctx.Int8Type(), 1, false)
+ 
+-	equal = llvm.AddFunction(tm.module, tm.mc.mangleEqualFunctionName(at), tm.equalFnType)
+-	equal.SetLinkage(llvm.LinkOnceODRLinkage)
+-	eqentrybb := llvm.AddBasicBlock(equal, "entry")
++	eqentrybb := llvm.AddBasicBlock(equalFn, "entry")
+ 	builder.SetInsertPointAtEnd(eqentrybb)
+ 	if at.Len() == 0 {
+ 		builder.CreateRet(onebool)
+ 	} else {
+-		a1ptr := builder.CreateBitCast(equal.Param(0), llelemty, "")
+-		a2ptr := builder.CreateBitCast(equal.Param(1), llelemty, "")
+-		loopbb := llvm.AddBasicBlock(equal, "loop")
++		a1ptr := builder.CreateBitCast(equalFn.Param(0), llelemty, "")
++		a2ptr := builder.CreateBitCast(equalFn.Param(1), llelemty, "")
++		loopbb := llvm.AddBasicBlock(equalFn, "loop")
+ 		builder.CreateBr(loopbb)
+ 
+-		exitbb := llvm.AddBasicBlock(equal, "exit")
+-		retzerobb := llvm.AddBasicBlock(equal, "retzero")
++		exitbb := llvm.AddBasicBlock(equalFn, "exit")
++		retzerobb := llvm.AddBasicBlock(equalFn, "retzero")
+ 
+ 		builder.SetInsertPointAtEnd(loopbb)
+ 		indexphi := builder.CreatePHI(tm.inttype, "")
+@@ -1412,10 +1450,10 @@
+ 		e2ptr := builder.CreateGEP(a2ptr, []llvm.Value{index}, "")
+ 		e2ptr = builder.CreateBitCast(e2ptr, i8ptr, "")
+ 
+-		equalcall := builder.CreateCall(eequal, []llvm.Value{e1ptr, e2ptr, esize}, "")
++		equalcall := tm.callEqualDescriptor(builder, eequal, e1ptr, e2ptr, esize)
+ 		equaleqzero := builder.CreateICmp(llvm.IntEQ, equalcall, zerobool, "")
+ 
+-		contbb := llvm.AddBasicBlock(equal, "cont")
++		contbb := llvm.AddBasicBlock(equalFn, "cont")
+ 		builder.CreateCondBr(equaleqzero, retzerobb, contbb)
+ 
+ 		builder.SetInsertPointAtEnd(contbb)
+@@ -1437,45 +1475,71 @@
+ 		builder.CreateRet(zerobool)
+ 	}
+ 
+-	tm.algs.Set(at, algorithmFns{hash, equal})
+ 	return
+ }
+ 
+-func (tm *TypeMap) getAlgorithmFunctions(t types.Type) (hash, equal llvm.Value) {
++func (tm *TypeMap) createAlgorithmDescriptor(name string, fn llvm.Value) llvm.Value {
++	d := llvm.AddGlobal(tm.module, tm.funcValType, name)
++	d.SetLinkage(llvm.LinkOnceODRLinkage)
++	d.SetGlobalConstant(true)
++	fn = llvm.ConstBitCast(fn, tm.funcValType.StructElementTypes()[0])
++	init := llvm.ConstNull(tm.funcValType)
++	init = llvm.ConstInsertValue(init, fn, []uint32{0})
++	d.SetInitializer(init)
++	return d
++}
++
++func (tm *TypeMap) callHashDescriptor(builder llvm.Builder, descriptor, ptr, size llvm.Value) llvm.Value {
++	hashFn := builder.CreateLoad(builder.CreateStructGEP(descriptor, 0, ""), "")
++	hashFn = builder.CreateBitCast(hashFn, tm.ptrHashFnNestType, "")
++	hashcall := builder.CreateCall(hashFn, []llvm.Value{descriptor, ptr, size}, "")
++	hashcall.AddInstrAttribute(1, llvm.NestAttribute)
++	return hashcall
++}
++
++func (tm *TypeMap) callEqualDescriptor(builder llvm.Builder, descriptor, ptr1, ptr2, size llvm.Value) llvm.Value {
++	equalFn := builder.CreateLoad(builder.CreateStructGEP(descriptor, 0, ""), "")
++	equalFn = builder.CreateBitCast(equalFn, tm.ptrEqualFnNestType, "")
++	equalcall := builder.CreateCall(equalFn, []llvm.Value{descriptor, ptr1, ptr2, size}, "")
++	equalcall.AddInstrAttribute(1, llvm.NestAttribute)
++	return equalcall
++}
++
++func (tm *TypeMap) getAlgorithmDescriptors(t types.Type) (hash, equal llvm.Value) {
+ 	switch t := t.Underlying().(type) {
+ 	case *types.Interface:
+ 		if t.NumMethods() == 0 {
+-			hash = tm.hashFnEmptyInterface
+-			equal = tm.equalFnEmptyInterface
++			hash = tm.hashFnEmptyInterfaceDescriptor
++			equal = tm.equalFnEmptyInterfaceDescriptor
+ 		} else {
+-			hash = tm.hashFnInterface
+-			equal = tm.equalFnInterface
++			hash = tm.hashFnInterfaceDescriptor
++			equal = tm.equalFnInterfaceDescriptor
+ 		}
+ 	case *types.Basic:
+ 		switch t.Kind() {
+ 		case types.Float32, types.Float64:
+-			hash = tm.hashFnFloat
+-			equal = tm.equalFnFloat
++			hash = tm.hashFnFloatDescriptor
++			equal = tm.equalFnFloatDescriptor
+ 		case types.Complex64, types.Complex128:
+-			hash = tm.hashFnComplex
+-			equal = tm.equalFnComplex
++			hash = tm.hashFnComplexDescriptor
++			equal = tm.equalFnComplexDescriptor
+ 		case types.String:
+-			hash = tm.hashFnString
+-			equal = tm.equalFnString
++			hash = tm.hashFnStringDescriptor
++			equal = tm.equalFnStringDescriptor
+ 		default:
+-			hash = tm.hashFnIdentity
+-			equal = tm.equalFnIdentity
++			hash = tm.hashFnIdentityDescriptor
++			equal = tm.equalFnIdentityDescriptor
+ 		}
+ 	case *types.Signature, *types.Map, *types.Slice:
+-		hash = tm.hashFnError
+-		equal = tm.equalFnError
++		hash = tm.hashFnErrorDescriptor
++		equal = tm.equalFnErrorDescriptor
+ 	case *types.Struct:
+ 		hash, equal = tm.getStructAlgorithmFunctions(t)
+ 	case *types.Array:
+ 		hash, equal = tm.getArrayAlgorithmFunctions(t)
+ 	default:
+-		hash = tm.hashFnIdentity
+-		equal = tm.equalFnIdentity
++		hash = tm.hashFnIdentityDescriptor
++		equal = tm.equalFnIdentityDescriptor
+ 	}
+ 
+ 	return
+@@ -1704,27 +1768,26 @@
+ }
+ 
+ func (tm *TypeMap) makeCommonType(t types.Type) llvm.Value {
+-	var vals [12]llvm.Value
++	var vals [11]llvm.Value
+ 	vals[0] = llvm.ConstInt(tm.ctx.Int8Type(), uint64(runtimeTypeKind(t)), false)
+ 	vals[1] = llvm.ConstInt(tm.ctx.Int8Type(), uint64(tm.Alignof(t)), false)
+ 	vals[2] = vals[1]
+ 	vals[3] = llvm.ConstInt(tm.inttype, uint64(tm.Sizeof(t)), false)
+ 	vals[4] = llvm.ConstInt(tm.ctx.Int32Type(), uint64(tm.getTypeHash(t)), false)
+-	hash, equal := tm.getAlgorithmFunctions(t)
++	hash, equal := tm.getAlgorithmDescriptors(t)
+ 	vals[5] = hash
+ 	vals[6] = equal
+ 	vals[7] = tm.getGcPointer(t)
+ 	var b bytes.Buffer
+ 	tm.writeType(t, &b)
+ 	vals[8] = tm.globalStringPtr(b.String())
+ 	vals[9] = tm.makeUncommonTypePtr(t)
+-	if _, ok := t.(*types.Named); ok {
++	switch t.(type) {
++	case *types.Named, *types.Struct:
+ 		vals[10] = tm.getTypeDescriptorPointer(types.NewPointer(t))
+-	} else {
++	default:
+ 		vals[10] = llvm.ConstPointerNull(llvm.PointerType(tm.commonTypeType, 0))
+ 	}
+-	vals[11] = tm.zeroValue
+-
+ 	return llvm.ConstNamedStruct(tm.commonTypeType, vals[:])
+ }
+ 
