@@ -1,4 +1,4 @@
-//===- llgoi.go - llgo-based Go REPL --------------------------------------===//
+//===- main.go - llgo-based Go REPL ------0--------------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This is llgoi, a Go REPL based on llgo and the LLVM JIT.
+// This is llgo-jupyter, a Jupyter kernel based on llgo and the LLVM JIT.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,16 +19,16 @@ import (
 	"go/scanner"
 	"go/token"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/axw/interputil"
-
 	"llvm.org/llgo/interp"
-	"llvm.org/llgo/third_party/liner"
 	"llvm.org/llvm/bindings/go/llvm"
+
+	"github.com/axw/go-jupyter"
 )
 
 // /* Force exporting __morestack if it's available, so that it is
@@ -99,57 +99,23 @@ func formatHistory(input string) string {
 }
 
 func main() {
-	prefix, err := getInstPrefix()
+	llvmInstallPrefix, err := getInstPrefix()
 	if err != nil {
 		panic(err)
 	}
-	in, err := interp.NewInterpreter(interp.Config{
+	connInfo, err := jupyter.ReadConnectionFile(os.Args[1])
+	if err != nil {
+		log.Fatalf("reading connection file: %v", err)
+	}
+	k := &llgoKernel{interpConfig: interp.Config{
 		ImportPaths: []string{
-			filepath.Join(prefix, "lib", "go", "llgo-"+llvmVersion()),
+			filepath.Join(llvmInstallPrefix, "lib", "go", "llgo-"+llvmVersion()),
 		},
-	})
-	if err != nil {
+	}}
+	if err := k.Init(); err != nil {
 		panic(err)
 	}
-	defer in.Dispose()
-
-	var buf interputil.Buffer
-	linerState := liner.NewLiner()
-	if liner.TerminalSupported() {
-		defer fmt.Println()
-	}
-
-	for {
-		prompt := "(llgo) "
-		if buf.Len() > 0 {
-			prompt = strings.Repeat(" ", len(prompt))
-		}
-		line, err := linerState.Prompt(prompt)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			panic(err)
-		}
-		if line == "" {
-			continue
-		}
-		if _, err := buf.WriteString(line + "\n"); err != nil {
-			panic(err)
-		}
-		if !buf.Ready() {
-			continue
-		}
-
-		results, err := in.Interpret(&buf)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-		}
-		for _, result := range results {
-			printResult(os.Stdout, result)
-			fmt.Println()
-		}
-		history := formatHistory(buf.String())
-		linerState.AppendHistory(history)
-		buf.Reset()
+	if err := jupyter.RunKernel(k, connInfo); err != nil {
+		log.Fatalf("running kernel: %v", err)
 	}
 }

@@ -14,7 +14,7 @@
 package irgen
 
 const (
-	goVersion = "go1.4.2"
+	goVersion = "go1.5.1"
 )
 
 // GoVersion returns the version of Go that we are targeting.

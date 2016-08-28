@@ -136,9 +136,23 @@ llvm_add_go_executable(llgoi llvm.org/llgo/cmd/llgoi ALL
           ${CMAKE_BINARY_DIR}/lib/go/llgo-${LLGO_VERSION}/cgo
           ${CMAKE_BINARY_DIR}/bin/llgo-go${CMAKE_EXECUTABLE_SUFFIX}
           cmd/llgoi/llgoi.go
+          interp/interp.go
   GOFLAGS "cc=${CMAKE_BINARY_DIR}/bin/clang"
           "cxx=${CMAKE_BINARY_DIR}/bin/clang++"
           "go=${CMAKE_BINARY_DIR}/bin/llgo-go"
+)
+
+llvm_add_go_executable(llgo-jupyter llvm.org/llgo/cmd/llgo-jupyter ALL
+  DEPENDS libgo ${CMAKE_BINARY_DIR}/bin/llgo${CMAKE_EXECUTABLE_SUFFIX}
+          ${CMAKE_BINARY_DIR}/lib/go/llgo-${LLGO_VERSION}/cgo
+          ${CMAKE_BINARY_DIR}/bin/llgo-go${CMAKE_EXECUTABLE_SUFFIX}
+          cmd/llgo-jupyter/main.go
+          cmd/llgo-jupyter/kernel.go
+          interp/interp.go
+  GOFLAGS "cc=${CMAKE_BINARY_DIR}/bin/clang"
+          "cxx=${CMAKE_BINARY_DIR}/bin/clang++"
+          "go=${CMAKE_BINARY_DIR}/bin/llgo-go"
+          "ldflags=-lzmq"
 )
 
 install(FILES ${CMAKE_BINARY_DIR}/bin/llgo${CMAKE_EXECUTABLE_SUFFIX}
